@@ -1332,3 +1332,76 @@ TEST_CASE("deregistering a poisoned instance evicted from the directory tears it
     REQUIRE(okWaiter.await());
     REQUIRE(okWaiter.env.kind == "ok");
 }
+
+// ── morph#523: the directory must learn a first action's outcome before any
+// ── host code can attach to its key ──────────────────────────────────────────
+//
+// `docs/spec/core/shared_instances.md`'s Failure modes section: an instance
+// whose first action failed "must not be handed to a *new* attacher". The
+// window in which it could be is the gap between the outcome being known and
+// the directory being told, and the framework itself hands control to host code
+// inside that gap -- `endSpan`, the metric sink and the `Completion`'s own
+// callbacks all run on the way out of a dispatch, and any of them may attach.
+//
+// The metric sink is the earliest of those and so pins the whole gap: a sink
+// that attaches on `executeErrors` is running at the instant the first action is
+// known to have failed. It must already be too late to be handed the failed
+// instance.
+TEST_CASE("an attach racing a failed first action out of the dispatch is not handed the failed instance",
+          "[shared-instances][backend]") {
+    morph::observe::ScopedObserveOverride const guard;
+    morph::exec::ThreadPoolExecutor pool{2};
+    morph::testing::InlineExecutor callbackExec;
+    morph::backend::LocalBackend backend{pool};
+    auto factory = [] { return morph::model::detail::ModelFactory::create<ShiCounterModel>(); };
+
+    auto const first = backend.registerModelShared("SHI_CounterModel", factory, {.contextKey = {}, .primary = "1"});
+
+    std::atomic<std::uint64_t> attached{0};
+    std::atomic<bool> reentered{false};
+    morph::observe::setMetricSink([&](const morph::observe::MetricEvent& evt) {
+        // `registerModelShared` below emits `registerCount` into this same
+        // sink; the latch keeps that re-entry from recursing.
+        if (evt.metric != morph::observe::Metric::executeErrors || reentered.exchange(true)) {
+            return;
+        }
+        attached.store(
+            backend.registerModelShared("SHI_CounterModel", factory, {.contextKey = {}, .primary = "1"}).v);
+    });
+
+    morph::backend::detail::ActionCall call;
+    call.modelTypeId = "SHI_CounterModel";
+    call.actionTypeId = "SHI_HydrateFail";
+    call.localOp = [](morph::model::detail::IModelHolder&) -> std::shared_ptr<void> {
+        throw std::runtime_error("hydration failed");
+    };
+    std::atomic<bool> errored{false};
+    backend.execute(first, std::move(call), &callbackExec).onError([&](const std::exception_ptr&) {
+        errored.store(true);
+    });
+    REQUIRE(morph::testing::waitUntil([&] { return errored.load(); }));
+
+    REQUIRE(reentered.load());
+    REQUIRE(attached.load() != 0U);
+    REQUIRE(attached.load() != first.v);
+}
+
+// The per-type index `listInstances` is served from must shrink as well as
+// grow: a type whose last shared instance has been released must report no
+// keys, not a stale one.
+TEST_CASE("releasing the last shared instance of a type empties its listInstances", "[shared-instances][backend]") {
+    morph::exec::ThreadPoolExecutor pool{2};
+    morph::backend::LocalBackend backend{pool};
+    auto factory = [] { return morph::model::detail::ModelFactory::create<ShiCounterModel>(); };
+
+    auto const mid = backend.registerModelShared("SHI_CounterModel", factory, {.contextKey = {}, .primary = "1"});
+    auto const alsoMid = backend.registerModelShared("SHI_CounterModel", factory, {.contextKey = {}, .primary = "1"});
+    REQUIRE(alsoMid == mid);
+    REQUIRE(backend.listInstances("SHI_CounterModel") == std::vector<std::string>{"1"});
+
+    // Two attachments, so the first release keeps the key listed.
+    backend.deregisterModel(mid);
+    REQUIRE(backend.listInstances("SHI_CounterModel") == std::vector<std::string>{"1"});
+    backend.deregisterModel(mid);
+    REQUIRE(backend.listInstances("SHI_CounterModel").empty());
+}
