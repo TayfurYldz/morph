@@ -172,6 +172,20 @@ struct QFSchedule {
     [[nodiscard]] bool validate() const { return morph::forms::allRequiredEngaged(*this); }
 };
 
+// Three `Choice` fields whose payload types differ (morph#543). Not registered
+// as an action anywhere -- only its generated schema is under test.
+struct QFMixedChoices {
+    morph::forms::Choice<bool, "QFListFlags"> flag;
+    morph::forms::Choice<std::int64_t, "QFListSlots"> slot;
+    morph::forms::Choice<std::string, "QFListCodes", "code", "title"> code;
+};
+
+// Two fields of one and the same `Choice` instantiation.
+struct QFTwinSlots {
+    morph::forms::Choice<std::int64_t, "QFListSlots"> morning;
+    morph::forms::Choice<std::int64_t, "QFListSlots"> evening;
+};
+
 struct QFCountryInfo {
     std::int64_t id = 0;
     std::string name;
@@ -614,6 +628,58 @@ TEST_CASE("Forms::SchemaJson::ChoiceAndDateTime", "[forms]") {
 
     // Both fields are required (non-optional, no opt-out).
     CHECK(schema.contains(R"("required":["slot","startsAt"])"));
+}
+
+TEST_CASE("Forms::SchemaJson::DifferentlyTypedChoiceFieldsKeepTheirOwnTypes", "[forms]") {
+    // Before morph#543 every `Choice<...>` instantiation was named "Choice",
+    // so glaze populated one `$defs/Choice` entry from whichever it reached
+    // first and had the rest `$ref` it: a `bool` picklist next to an
+    // `int64_t` one described the int64 field as a boolean, and
+    // DynamicForm.qml resolves the `$ref` and draws a checkbox for a
+    // "boolean" type. A single-`Choice` action passes either way, so this
+    // fixture carries three of different types.
+    auto const schema = morph::forms::schemaJson<QFMixedChoices>();
+    auto parsed = glz::read_json<glz::generic>(schema);
+    REQUIRE(parsed.has_value());
+
+    // NOLINTBEGIN(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access) -- glaze DOM requires operator[]
+    auto const& root = parsed.value();
+
+    // Resolves a property to the node that actually describes it: the `$def`
+    // it points at, or the property itself when glaze inlined the shape.
+    auto firstTypeOf = [&root](std::string_view field) {
+        auto const& property = root["properties"][field];
+        auto const& described =
+            property.contains("$ref")
+                ? root["$defs"][property["$ref"].get<std::string>().substr(std::string_view{"#/$defs/"}.size())]
+                : property;
+        REQUIRE(described.contains("type"));
+        return described["type"].get_array().at(0).get<std::string>();
+    };
+
+    CHECK(firstTypeOf("flag") == "boolean");
+    CHECK(firstTypeOf("slot") == "integer");
+    CHECK(firstTypeOf("code") == "string");
+
+    // The options metadata still rides on the property, one set per field.
+    CHECK(root["properties"]["slot"]["x-optionsAction"].get<std::string>() == "QFListSlots");
+    CHECK(root["properties"]["code"]["x-optionsAction"].get<std::string>() == "QFListCodes");
+    // NOLINTEND(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+}
+
+TEST_CASE("Forms::SchemaJson::ChoiceFieldsOfOneInstantiationShareOneDefinition", "[forms]") {
+    // Two fields of the *same* `Choice` instantiation describe the same shape,
+    // so one `$defs` entry serves both -- the split is per instantiation, not
+    // per field.
+    auto const schema = morph::forms::schemaJson<QFTwinSlots>();
+    auto parsed = glz::read_json<glz::generic>(schema);
+    REQUIRE(parsed.has_value());
+
+    // NOLINTBEGIN(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access) -- glaze DOM requires operator[]
+    auto const& root = parsed.value();
+    CHECK(root["properties"]["morning"]["$ref"].get<std::string>() ==
+          root["properties"]["evening"]["$ref"].get<std::string>());
+    // NOLINTEND(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
 }
 
 TEST_CASE("Forms::DispatchChoiceActionThroughRegistry", "[forms]") {

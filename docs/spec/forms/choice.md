@@ -130,35 +130,56 @@ rules.
 
 ## Schema representation
 
-The `glz::meta` specialisation sets `name = "Choice"` for *every*
-instantiation, regardless of `T`, `OptionsAction`, `ValueField`, `LabelField`,
-or `DependsOn`. glaze uses that name as the type's key in the schema's `$defs`
-block and as the `$ref` target for each property. Two consequences follow, both
-intentional:
+The `glz::meta` specialisation composes `name` **per instantiation**, from the
+`FixedString` template arguments:
 
-- **`$defs` collapses all `Choice<...>` to one entry.** `Choice<int64_t,
-  "ListSamples">` and `Choice<std::string, "ListPayees", "code", "label">`
-  both resolve to `$defs/Choice` and share a single `$ref`. glaze does not
-  suffix the name to keep them apart, so whichever it emits describes only the
-  common shape.
-- **That shared shape is the bare nullable value.** Because `meta::value`
-  points at the `value` member, the `$defs/Choice` entry describes only
-  `std::optional<T>` — a nullable scalar/string, carrying none of the options
-  metadata. Nothing that distinguishes one `Choice` field from another lives
-  in `$defs`.
+```
+Choice_<OptionsAction>_<ValueField>_<LabelField>[_<DependsOn>...]
+```
 
-The collision is therefore benign: the parts that *do* differ between fields —
-which action to call, which result fields to read, and (for a dependent
-`Choice`) which sibling fields parameterise it — are emitted by
+so `Choice<std::int64_t, "ListSamples">` keys `$defs/Choice_ListSamples_id_name`
+and `Choice<std::string, "ListPayees", "code", "label">` keys
+`$defs/Choice_ListPayees_code_label`. glaze uses that name as the type's key in
+the `$defs` block and as the `$ref` target for each property.
+
+**The name has to vary, because glaze populates a `$defs` entry only once.**
+Its schema writer does `auto& def = defs[name_v<T>]; if (!def.type) { … }`, so
+when two instantiations shared the single name `"Choice"`, the second one was
+skipped and `$ref`ed the *first* one's definition. An action holding a `bool`
+picklist and an `int64_t` picklist described the int64 field as a boolean —
+and `DynamicForm.qml` resolves the `$ref`, reads `type`, and draws a checkbox
+for `"boolean"`. A generic validating client is misled the same way, since the
+document ships `additionalProperties: false` and a standard `required` array,
+i.e. it is presented as validatable. That was morph#543.
+
+Two properties of the composed name are deliberate:
+
+- **It is built only from names spelled in these sources**, never from
+  `glz::name_v`. That fallback is derived from `__PRETTY_FUNCTION__` /
+  `__FUNCSIG__` and differs between compilers, which would make a `$defs` key
+  — and so the whole schema — unreadable by a peer build. `Quantity` composes
+  its name from `UnitTraits<…>::meta(U).id` for the same reason.
+- **Two fields of the same instantiation still share one entry.** That is what
+  `$defs` is for: their definitions are identical, so splitting them would only
+  enlarge the document.
+
+The shape each entry describes is the bare nullable value: because
+`meta::value` points at the `value` member, a `Choice` definition is the schema
+of `std::optional<T>` and carries none of the options metadata. The parts that
+differ between fields — which action to call, which result fields to read, and
+(for a dependent `Choice`) which sibling fields parameterise it — are emitted by
 `mergeSchemaExtras` as **property-level** `x-optionsAction` / `x-optionValue` /
 `x-optionLabel` / `x-optionsDependsOn` annotations, one set per property,
-alongside `x-order` and the derived `required` array. A renderer reads those
-from the property, not from `$defs`, so it never depends on the shared
-`$defs/Choice` node to tell two `Choice` fields apart. The one caveat, when `T`
-varies across `Choice` fields in the same action, is that the single
-`$defs/Choice` payload type cannot be correct for all of them; renderers that
-submit the raw nullable value observe no problem, since the wire value is
-validated by the action, not by the schema.
+alongside `x-order` and the derived `required` array.
+
+One residual case is left uncovered on purpose: two `Choice` fields naming the
+*same* `OptionsAction`, `ValueField` and `LabelField` but a different `T` still
+share a key. Those two fields read one column of one result set, which has one
+type, so a differing `T` between them is an author error rather than a shape
+the key is asked to keep apart.
+
+Because these keys are part of the emitted document, changing this composition
+is a wire-shape change for any client that resolves `$ref` targets by name.
 
 ## API reference
 
